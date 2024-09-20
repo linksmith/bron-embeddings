@@ -46,12 +46,18 @@ import dateparser
 import pynvml  # For GPU temperature monitoring
 import contextlib  # For suppressing stdout and stderr
 import logging  # For adjusting logging levels
+from joblib import Parallel, delayed
+from math import ceil
+from tqdm_joblib import tqdm_joblib  # Import tqdm_joblib
+
 
 # Define the path to your models directory
 models_dir = os.path.join(os.path.dirname(__file__), 'models')
 
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ['TRANSFORMERS_CACHE'] = models_dir
+# Suppress specific FutureWarning from transformers library
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers.utils.generic")
+# os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Suppress logging messages from the 'unstructured' library
 logging.getLogger('unstructured').setLevel(logging.ERROR)
@@ -59,7 +65,7 @@ logging.getLogger('lxml').setLevel(logging.ERROR)
 
 # Constants
 NUM_WORKERS = 16
-BATCH_SIZE = 10000  # Number of documents to process from Elasticsearch in each batch
+BATCH_SIZE = 1000  # Number of documents to process from Elasticsearch in each batch
 SLEEP_TIME = 0     # Set sleep time to zero since GPUs are underutilized
 DENSE_BATCH_SIZE = 512   # Increased batch size for dense embeddings per GPU
 NER_BATCH_SIZE = 512    # Increased batch size for NER per GPU
@@ -199,6 +205,35 @@ def parse_date(input_string):
         return None
     else:
         return date.strftime('%Y-%m-%d')
+    
+def prepare_entities_for_qdrant(rows, idx):
+    """Prepare the entities for the qdrant points."""
+    entities, dates, locations, people, organisations, times = [], [], [], [], [], []
+    entity_types = ["DATE", "GPE", "PERSON", "ORG", "TIME"]
+    for entity in rows[idx]["entities"].ents:
+        if entity.label_ in entity_types:
+            entities.append({
+                "text": entity.text,
+                "label": entity.label_,
+                "start": entity.start_char,
+                "end": entity.end_char,
+            })
+
+            if entity.label_ == "DATE":
+                if entity.text not in dates:
+                    date = parse_date(entity.text)
+                    if date is not None:
+                        dates.append(date)
+            elif entity.label_ == "GPE":
+                if entity.text not in locations:
+                    locations.append(entity.text)
+            elif entity.label_ == "PERSON":
+                if entity.text not in people:
+                    people.append(entity.text)
+            elif entity.label_ == "ORG":
+                if entity.text not in organisations:
+                    organisations.append(entity.text)
+    return entities, dates, locations, people, organisations, times
 
 def make_qdrant_points(df: pd.DataFrame, starting_id) -> List[PointStruct]:
     sparse_vectors = df["sparse_embedding"].tolist()
@@ -222,32 +257,8 @@ def make_qdrant_points(df: pd.DataFrame, starting_id) -> List[PointStruct]:
                 "values": [sv.values.tolist() for sv in sparse_vector]
             }
 
-        # Prepare the entities for the qdrant points
-        entities, dates, locations, people, organisations, times = [], [], [], [], [], []
-        entity_types = ["DATE", "GPE", "PERSON", "ORG", "TIME"]
-        for entity in rows[idx]["entities"].ents:
-            if entity.label_ in entity_types:
-                entities.append({
-                    "text": entity.text,
-                    "label": entity.label_,
-                    "start": entity.start_char,
-                    "end": entity.end_char,
-                })
-
-                if entity.label_ == "DATE":
-                    if entity.text not in dates:
-                        date = parse_date(entity.text)
-                        if date is not None:
-                            dates.append(date)
-                elif entity.label_ == "GPE":
-                    if entity.text not in locations:
-                        locations.append(entity.text)
-                elif entity.label_ == "PERSON":
-                    if entity.text not in people:
-                        people.append(entity.text)
-                elif entity.label_ == "ORG":
-                    if entity.text not in organisations:
-                        organisations.append(entity.text)
+        # Use the new function in the existing code
+        # entities, dates, locations, people, organisations, times = prepare_entities_for_qdrant(rows, idx)
 
         point = PointStruct(
             id=starting_id + idx,  # Ensure unique IDs across batches
@@ -263,12 +274,12 @@ def make_qdrant_points(df: pd.DataFrame, starting_id) -> List[PointStruct]:
                 "type": rows[idx]["type"],
                 "identifier": rows[idx]["identifier"],
                 "url": rows[idx]["url"],
-                "ner_entities": entities,
-                "ner_dates": dates,
-                "ner_locations": locations,
-                "ner_people": people,
-                "ner_organisations": organisations,
-                "ner_times": times,
+                # "ner_entities": entities,
+                # "ner_dates": dates,
+                # "ner_locations": locations,
+                # "ner_people": people,
+                # "ner_organisations": organisations,
+                # "ner_times": times,
                 "chunk_index": rows[idx]["chunk_index"],
                 "chunk_count": rows[idx]["chunk_count"],
             },
@@ -295,7 +306,17 @@ def process_batch(df, collection_name, starting_id):
     # Run embeddings
     df["dense_embedding"] = make_dense_embedding(texts)
     df["sparse_embedding"] = make_sparse_embedding(texts)
-    df["entities"] = run_ner_pipeline(texts)
+    # # time the difference:
+    # start = time.time()
+
+    # df["entities_0"] = run_spacy_ner_pipeline(texts)
+    # end = time.time()
+    # print(f"spaCy time taken: {end - start}")
+
+    # start = time.time()
+    # df["entities_1"] = run_flair_ner_pipeline(texts)
+    # end = time.time()
+    # print(f"Flair time taken: {end - start}")
 
     # Create Qdrant points with unique IDs
     points = make_qdrant_points(df, starting_id)
@@ -307,6 +328,20 @@ def main(what_to_index='3_gemeentes'):
     # Connect to Elasticsearch
     es = Elasticsearch("http://localhost:9200")
     index_name = "jodal_documents7"
+
+    query_1_gemeente = {
+        "query": {
+            "bool": {
+                "must": [
+                    {"exists": {"field": "description"}}
+                ],
+                "minimum_should_match": 1,
+                "should": [
+                    {"match_phrase": {"location": "GM0141"}},
+                ]
+            }
+        }
+    }
 
     # Define your queries
     query_3_gemeentes = {
@@ -371,7 +406,9 @@ def main(what_to_index='3_gemeentes'):
         }
     }
 
-    # Determine which query to use
+    # Determine which query to use    
+    if what_to_index == '1_gemeente':
+        query = query_1_gemeente
     if what_to_index == '3_gemeentes':
         query = query_3_gemeentes
     elif what_to_index == 'overijssel':
@@ -536,58 +573,135 @@ def make_sparse_embedding(texts: List[str]) -> List[SparseEmbedding]:
     embeddings = embeddings_0 + embeddings_1
     return embeddings
 
-def ner_pipeline(docs, gpu_id, batch_size):
-    import torch
-    import spacy
-    import os
+def split_list(lst: List[str], n: int) -> List[List[str]]:
+    from math import ceil
+    """
+    Split a list into n approximately equal parts.
 
-    torch.cuda.empty_cache()
-    torch.cuda.set_device(gpu_id)
-    spacy.require_gpu()
-    nlp = spacy.load("nl_core_news_lg")
+    Args:
+        lst (List[str]): The list to split.
+        n (int): Number of sublists.
 
+    Returns:
+        List[List[str]]: A list containing n sublists.
+    """
+    avg = ceil(len(lst) / n)
+    return [lst[i * avg : (i + 1) * avg] for i in range(n)]
+
+def load_nlp():
+    """
+    Function to load the NLP model.
+    This will be called in each worker process.
+    """
+    return spacy.load("nl_core_news_lg")  # Replace with your model
+
+
+def ner_pipeline(docs):
+    nlp = load_nlp()  # Load the NLP model in each worker
     entities = []
-    try:
-        for doc in nlp.pipe(docs, batch_size=batch_size):
-            entities.append(doc)
-    finally:
-        # Release GPU resources
-        torch.cuda.empty_cache()
-        del nlp
+    for doc in nlp.pipe(docs, batch_size=512):  # Adjust batch_size as needed
+        entities.append(doc)
     return entities
 
+def chunker(lst: List[str], total: int, chunksize: int) -> List[List[str]]:
+    """Yield successive chunks from lst of size chunksize."""
+    for i in range(0, total, chunksize):
+        yield lst[i:i + chunksize]
 
-def run_ner_pipeline(texts: List[str]):
-    batch_size_per_gpu = NER_BATCH_SIZE
+def flatten(list_of_lists: List[List[str]]) -> List[str]:
+    """Flatten a list of lists into a single list."""
+    return [item for sublist in list_of_lists for item in sublist]
+
+def run_spacy_ner_pipeline(texts: List[str]) -> List[str]:
+    """
+    Process a list of texts using NER in parallel with a progress bar.
+
+    Args:
+        texts (List[str]): The list of texts to process.
+
+    Returns:
+        List[str]: The list of processed texts.
+    """
+    batch_size = NER_BATCH_SIZE
+    total_texts = len(texts)
+    max_workers = multiprocessing.cpu_count()
+
+    # Calculate the number of chunks
+    num_chunks = ceil(total_texts / batch_size)
+
+    # Initialize the progress bar using tqdm_joblib
+    with tqdm_joblib(tqdm(total=num_chunks, desc="Processing spaCy NER pipeline", unit="chunk")):
+        # Set up the Parallel executor
+        executor = Parallel(
+            n_jobs=max_workers,
+            backend='multiprocessing',
+            prefer="processes",
+            verbose=0  # Set to 0 to avoid joblib's own progress messages
+        )
+        do = delayed(ner_pipeline)
+        tasks = (do(chunk) for chunk in chunker(texts, total_texts, chunksize=batch_size))
+        result = executor(tasks)
+
+    # Flatten the list of results
+    return flatten(result)
+
+def run_flair_nlp(run_flair_nlp, texts: List[str], progress_bar, batch_size, gpu_index):
+    import flair
+    from flair.data import Sentence
+    from flair.nn import Classifier
+    from flair.splitter import SegtokSentenceSplitter
+
+    docs = []
+    flair.device = torch.device(gpu_index)  # cuda:0
+    # initialize sentence splitter
+    splitter = SegtokSentenceSplitter()
+
+    for text in texts:
+        entities = []
+
+        # use splitter to split text into list of sentences
+        sentences = splitter.split(text)
+        run_flair_nlp.predict(sentences, mini_batch_size=batch_size)
+
+        # iterate through sentences and print predicted labels
+        for sentence in sentences:
+            entities.append(sentence.to_dict(tag_type='ner'))
+
+        docs.append(entities)           
+
+        progress_bar.update(1) 
+
+    return docs
+
+def run_flair_ner_pipeline(texts: List[str]):
+    total_docs = len(texts)
+
     # Split documents between the two GPUs
-    mid_point = len(texts) // 2
+    mid_point = total_docs // 2
     docs_0 = texts[:mid_point]
     docs_1 = texts[mid_point:]
 
-    # Run inference on both GPUs in parallel using multiprocessing
-    total_docs = len(texts)
-    with tqdm(total=total_docs, desc="Running NER pipeline", position=1, leave=False) as progress_bar:
-        with ProcessPoolExecutor(max_workers=2) as executor:
-            future_0 = executor.submit(ner_pipeline, docs_0, 0, batch_size_per_gpu)
-            future_1 = executor.submit(ner_pipeline, docs_1, 1, batch_size_per_gpu)
+    batch_size_per_gpu = 512  # You can adjust this if needed
 
-            # Use as_completed to update progress bar
-            from concurrent.futures import as_completed
-            for future in as_completed([future_0, future_1]):
-                result = future.result()
-                progress_bar.update(len(result))
+    with tqdm(total=total_docs, desc="Generating NER entities", position=1, leave=False) as progress_bar:
+        # Run inference on both GPUs in parallel
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future_0 = executor.submit(run_flair_nlp, flair_ner_0, texts, progress_bar, batch_size_per_gpu, 0)
+            # future_1 = executor.submit(run_flair_nlp, flair_ner_1, docs_1, progress_bar, batch_size_per_gpu, 1)
 
             entities_0 = future_0.result()
-            entities_1 = future_1.result()
+            # entities_1 = future_1.result()
 
-    # Combine results
-    entities = entities_0 + entities_1
-    return entities
+    return entities_0
+    # entities = entities_0 + entities_1
+    # return entities
 
 # Initialize the models on different GPUs
 def initialize_models():
-    global dense_document_embedder_0, dense_document_embedder_1
-    global sparse_document_embedder_0, sparse_document_embedder_1
+    from flair.nn import Classifier
+
+    global dense_document_embedder_0, dense_document_embedder_1, flair_ner_0
+    global sparse_document_embedder_0, sparse_document_embedder_1, flair_ner_1
 
     # Create two separate inference sessions, one for each GPU
     session_options_0 = ort.SessionOptions()
@@ -602,28 +716,35 @@ def initialize_models():
 
     # Initialize the models on different GPUs
     dense_document_embedder_0 = TextEmbedding(
+        cache_dir=models_dir,
         model_name="intfloat/multilingual-e5-large",
         session_options=session_options_0,
         providers=[("CUDAExecutionProvider", {"device_id": 0})]
     )
 
     dense_document_embedder_1 = TextEmbedding(
+        cache_dir=models_dir,
         model_name="intfloat/multilingual-e5-large",
         session_options=session_options_1,
         providers=[("CUDAExecutionProvider", {"device_id": 1})]
     )
 
     sparse_document_embedder_0 = SparseTextEmbedding(
+        cache_dir=models_dir,
         model_name="Qdrant/bm25",
         session_options=session_options_0,
         providers=[("CUDAExecutionProvider", {"device_id": 0})]
     )
 
     sparse_document_embedder_1 = SparseTextEmbedding(
+        cache_dir=models_dir,
         model_name="Qdrant/bm25",
         session_options=session_options_1,
         providers=[("CUDAExecutionProvider", {"device_id": 1})]
     )
+
+    flair_ner_0 = Classifier.load('nl-ner-large')
+    # flair_ner_1 = Classifier.load('nl-ner-large')
 
 if __name__ == "__main__":
     import multiprocessing

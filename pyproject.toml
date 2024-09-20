@@ -1,0 +1,77 @@
+[tool.poetry]
+name = "bron-embeddings"
+version = "0.1.0"
+description = "Embed texts for Bron"
+authors = ["Linksmith <info@linksmith.nl>"]
+readme = "README.md"
+
+[[tool.poetry.source]]
+name = "onnxruntime-cuda-12"
+url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+secondary = true
+
+[tool.poetry.dependencies]
+python = "^3.10"
+elasticsearch = "^8.15.1"
+pandas = "^2.2.2"
+tqdm = "^4.66.5"
+pyarrow = "^17.0.0"
+numpy = "^1.26.4"
+unstructured = "^0.25.8"
+lxml = "^5.3.0"
+torch = "^2.4.1"
+transformers = "^4.44.2"
+onnx = "^1.16.2"
+onnxruntime-gpu = { version = "1.19.2", source = "onnxruntime-cuda-12" }
+spacy[cuda12x] = "^3.7.6"
+nl-core-news-lg = { url = "https://github.com/explosion/spacy-models/releases/download/nl_core_news_lg-3.7.0/nl_core_news_lg-3.7.0-py3-none-any.whl", hash = "sha256:02194e98105584a6e5008a523a94a5d6e4da2feb0964741646c507c8e20730d4" }
+#qdrant-client = "^1.11.1"
+qdrant-client[fastembed-gpu]
+fastembed-gpu = "^0.3.6"
+dateparser = "^1.2.0"
+nvidia-ml-py3== = "^7.352.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.dev-dependencies]
+# Add any development dependencies here, such as linters, formatters, or testing frameworks.
+pytest = "^7.2.0"
+black = "^23.1.0"
+flake8 = "^6.0.0"
+mypy = "^0.971"
+
+
+[tool.poetry.scripts]
+bron_embeddings = "app:main"
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+
+[tool.isort]
+profile = "black"
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = ["E203", "W503"]
+
+[tool.mypy]
+python_version = 3.10
+ignore_missing_imports = true
+strict = true
