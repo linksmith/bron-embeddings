@@ -50,10 +50,5 @@ dist/**
 package.nls.*.json
 l10n/
 python-env-tools/**
-/data/documents/** */
-/data/*.csv
-/data/*.jsonl
-/data/*.json
-/data/*.txt
-/data/*.parquet
-/models/**
+data/**
+models/**
