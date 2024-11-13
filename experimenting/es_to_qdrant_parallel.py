@@ -220,6 +220,11 @@ def make_qdrant_points(df: pd.DataFrame, starting_id) -> List[PointStruct]:
                 "values": [sv.values.tolist() for sv in sparse_vector]
             }
 
+        if "doc_url" in rows[idx]:
+            doc_url = rows[idx]["doc_url"]
+        else:
+            doc_url = ""
+
         # Use the new function in the existing code
         # entities, dates, locations, people, organisations, times = prepare_entities_for_qdrant(rows, idx)
 
@@ -237,6 +242,7 @@ def make_qdrant_points(df: pd.DataFrame, starting_id) -> List[PointStruct]:
                 "type": rows[idx]["type"],
                 "identifier": rows[idx]["identifier"],
                 "url": rows[idx]["url"],
+                "doc_url": doc_url,
                 "chunk_index": rows[idx]["chunk_index"],
                 "chunk_count": rows[idx]["chunk_count"],
             },
@@ -438,20 +444,20 @@ def main(what_to_index='3_gemeentes', local_embeddings=True):
             try:
                 # Use scan to retrieve documents
                 es_scan = scan(client=es, index=index_name, query=query, scroll='10m', size=BATCH_SIZE)
-                batches = batch_iterator(es_scan, batch_size)
+                document_batch = batch_iterator(es_scan, batch_size)
 
-                for batch_num, batch in enumerate(batches):
+                for batch_num, es_doc in enumerate(document_batch):
                     batch_start_time = time.time()
 
                     # Process documents in the batch
                     max_workers = multiprocessing.cpu_count()
                     with multiprocessing.Pool(processes=max_workers) as pool:
-                        processed_docs_iter = pool.imap_unordered(process_document, batch, chunksize=100)
+                        processed_docs_iter = pool.imap_unordered(process_document, es_doc, chunksize=100)
                         processed_docs = []
                         batch_errors = 0  # Error count for the batch
 
                         # Sub-progress bar for processing documents
-                        with tqdm(total=len(batch), desc="Processing documents", position=1, leave=False) as doc_pbar:
+                        with tqdm(total=len(es_doc), desc="Processing documents", position=1, leave=False) as doc_pbar:
                             for result in processed_docs_iter:
                                 doc_pbar.update(1)
                                 if result is not None:
@@ -481,7 +487,7 @@ def main(what_to_index='3_gemeentes', local_embeddings=True):
                     total_points_processed += num_points_in_batch
 
                     # Update progress bar
-                    pbar.update(len(batch))
+                    pbar.update(len(es_doc))
 
                     # Time calculations
                     elapsed_time = time.time() - start_time

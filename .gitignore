@@ -52,3 +52,5 @@ l10n/
 python-env-tools/**
 data/**
 models/**
+
+.env

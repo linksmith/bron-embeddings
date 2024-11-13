@@ -1,0 +1,126 @@
+components:
+  dense_text_embedder:
+    init_parameters:
+      api_base_url: https://api.cohere.com
+      api_key:
+        env_vars:
+        - COHERE_API_KEY
+        - CO_API_KEY
+        strict: true
+        type: env_var
+      input_type: search_query
+      model: embed-multilingual-light-v3.0
+      timeout: 120
+      truncate: END
+      use_async_client: false
+    type: haystack_integrations.components.embedders.cohere.text_embedder.CohereTextEmbedder
+  hybrid_retriever:
+    init_parameters:
+      document_store:
+        init_parameters:
+          api_key: null
+          embedding_dim: 384
+          force_disable_check_same_thread: false
+          grpc_port: 6334
+          hnsw_config: null
+          host: localhost
+          https: null
+          index: 1_gemeente_cohere
+          init_from: null
+          location: null
+          metadata: {}
+          on_disk: false
+          on_disk_payload: null
+          optimizers_config: null
+          path: null
+          payload_fields_to_index: null
+          port: 6333
+          prefer_grpc: false
+          prefix: null
+          progress_bar: true
+          quantization_config: null
+          recreate_index: false
+          replication_factor: null
+          return_embedding: false
+          scroll_size: 10000
+          shard_number: null
+          similarity: cosine
+          sparse_idf: false
+          timeout: null
+          url: null
+          use_sparse_embeddings: true
+          wait_result_from_api: true
+          wal_config: null
+          write_batch_size: 100
+          write_consistency_factor: null
+        type: haystack_integrations.document_stores.qdrant.document_store.QdrantDocumentStore
+      filter_policy: replace
+      filters: null
+      group_by: null
+      group_size: null
+      return_embedding: false
+      score_threshold: null
+      top_k: 50
+    type: haystack_integrations.components.retrievers.qdrant.retriever.QdrantHybridRetriever
+  llm:
+    init_parameters:
+      api_base_url: https://api.cohere.com
+      api_key:
+        env_vars:
+        - COHERE_API_KEY
+        - CO_API_KEY
+        strict: true
+        type: env_var
+      generation_kwargs: {}
+      model: command-r-plus
+      streaming_callback: null
+    type: haystack_integrations.components.generators.cohere.generator.CohereGenerator
+  prompt_builder:
+    init_parameters:
+      required_variables: null
+      template: "\nYou will be provided with Dutch language docunents. Create informative\
+        \ answer in Dutch for a given question based solely on the provided documents.\
+        \ Use citations to support your answer.\n\n\nDocuments:\n{% for document in\
+        \ documents %}\n    {{ document.content }}\n{% endfor %}\n\n\nQuestion: {{question}};\n\
+        \nAnswer (include citations):\n"
+      variables: null
+    type: haystack.components.builders.prompt_builder.PromptBuilder
+  reranker:
+    init_parameters:
+      api_base_url: https://api.cohere.com
+      api_key:
+        env_vars:
+        - COHERE_API_KEY
+        - CO_API_KEY
+        strict: true
+        type: env_var
+      max_chunks_per_doc: null
+      meta_data_separator: '
+
+        '
+      meta_fields_to_embed: []
+      model: rerank-multilingual-v3.0
+      top_k: 20
+    type: haystack_integrations.components.rankers.cohere.ranker.CohereRanker
+  sparse_text_embedder:
+    init_parameters:
+      cache_dir: null
+      local_files_only: false
+      model: Qdrant/bm25
+      parallel: null
+      progress_bar: true
+      threads: null
+    type: haystack_integrations.components.embedders.fastembed.fastembed_sparse_text_embedder.FastembedSparseTextEmbedder
+connections:
+- receiver: hybrid_retriever.query_embedding
+  sender: dense_text_embedder.embedding
+- receiver: hybrid_retriever.query_sparse_embedding
+  sender: sparse_text_embedder.sparse_embedding
+- receiver: reranker.documents
+  sender: hybrid_retriever.documents
+- receiver: prompt_builder.documents
+  sender: reranker.documents
+- receiver: llm.prompt
+  sender: prompt_builder.prompt
+max_runs_per_component: 100
+metadata: rag_pipe
