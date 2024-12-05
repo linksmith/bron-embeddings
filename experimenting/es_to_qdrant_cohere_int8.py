@@ -747,7 +747,7 @@ def main(what_to_index='3_gemeentes'):
 
     print(f"Processing {total_batches} batches of each {batch_size}")
     try:
-        with tqdm(total=total_docs, desc=f"Total progress", position=0, dynamic_ncols=True) as pbar:
+        with tqdm(total=total_docs, desc="Total progress", position=0, dynamic_ncols=True) as pbar:
             while True:
                 try:
                     # Use scan to retrieve documents
@@ -768,7 +768,28 @@ def main(what_to_index='3_gemeentes'):
                                     qdrant_payloads.extend(doc)
 
                             if qdrant_payloads:
-                                texts_to_embed = [get_human_readable_source(doc['meta']['source']) + " van " + doc['meta']['location_name'] + " \n" + doc['meta']['title']  + " \n" + doc['content'] for doc in qdrant_payloads]
+                                texts_to_embed = []
+                                for doc in qdrant_payloads:
+                                    try:
+                                        source = get_human_readable_source(doc['meta'].get('source', ''))
+                                        location = doc['meta'].get('location_name', '')
+                                        title = doc['meta'].get('title', '')
+                                        content = doc.get('content', '')
+                                        
+                                        text = ""
+                                        if source and source != '':
+                                            text += f"{source} van "
+                                        if location and location != '':
+                                            text += f"{location} \n"
+                                        if title and title != '':
+                                            text += f"{title} \n"
+                                        if content and content != '':
+                                            text += f"{content}"
+                                            
+                                        texts_to_embed.append(text)
+                                    except Exception as e:
+                                        logger.error(f"Error creating text to embed: {str(e)}")
+                                        continue
                                 
                                 # Process dense embeddings
                                 with multiprocessing.Pool(processes=max_workers) as pool:
