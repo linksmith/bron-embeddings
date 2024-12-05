@@ -82,6 +82,16 @@ NEW_AFTER_N_CHARS=1000
 MAX_PARTITION=1000
 OVERLAP=100
 
+HUMAN_READABLE_SOURCES = {
+    "openbesluitvorming": "Raadstuk of bijlage",
+    "poliflw": "Politiek nieuwsbericht",
+    "openspending": "Begrotingsdata",
+    "woogle": "Woo-verzoek",
+    "obk": "Officiële bekendmaking",
+    "cvdr": "Rapport",
+    "oor": "Lokale wet- en regelgeving",
+}
+
 # Initialize NVML for GPU temperature monitoring (optional, can be removed if not needed)
 # pynvml.nvmlInit()
 from functools import lru_cache
@@ -161,6 +171,10 @@ def is_empty(text):
 
 # Pattern to match "Pagina X van Y" where X and Y are numbers
 pagina_pattern_1 = r'Pagina \d+ van \d+'
+
+
+def get_human_readable_source(source: str) -> str: 
+    return HUMAN_READABLE_SOURCES.get(source, source)
 
 def clean_page_numbers(text):
     return re.sub(pagina_pattern_1, '', text)
@@ -754,17 +768,18 @@ def main(what_to_index='3_gemeentes'):
                                     qdrant_payloads.extend(doc)
 
                             if qdrant_payloads:
-                                texts = [doc['content'] for doc in qdrant_payloads]
+                                texts_to_embed = [get_human_readable_source(doc['meta']['source']) + " van " + doc['meta']['location_name'] + " \n" + doc['meta']['title']  + " \n" + doc['content'] for doc in qdrant_payloads]
+                                
                                 # Process dense embeddings
                                 with multiprocessing.Pool(processes=max_workers) as pool:
-                                    pool_args = [(texts[i:i+DENSE_BATCH_SIZE]) 
-                                                 for i in range(0, len(texts), DENSE_BATCH_SIZE)]
+                                    pool_args = [(texts_to_embed[i:i+DENSE_BATCH_SIZE]) 
+                                                 for i in range(0, len(texts_to_embed), DENSE_BATCH_SIZE)]
                                     dense_embeddings_list = pool.map(generate_dense_embeddings_in_pool, pool_args)
                                                                   
                                 dense_embeddings = [doc for sublist in dense_embeddings_list for doc in sublist if sublist]    
                                 
                                 # Process sparse embeddings
-                                sparse_embeddings = generate_sparse_embedding(texts)  
+                                sparse_embeddings = generate_sparse_embedding(texts_to_embed)  
                                 points = make_qdrant_points(qdrant_payloads, dense_embeddings, sparse_embeddings)                                
                                 upsert_with_progress(collection_name, points)
 
