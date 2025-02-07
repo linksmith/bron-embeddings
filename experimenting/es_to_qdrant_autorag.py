@@ -80,7 +80,7 @@ COMBINE_TEXT_UNDER_N_CHARS=800
 MAX_CHARACTERS=1000
 NEW_AFTER_N_CHARS=1000
 MAX_PARTITION=1000
-OVERLAP=100
+OVERLAP=75
 
 HUMAN_READABLE_SOURCES = {
     "openbesluitvorming": "Raadstuk of bijlage",
@@ -88,8 +88,8 @@ HUMAN_READABLE_SOURCES = {
     "openspending": "Begrotingsdata",
     "woogle": "Woo-verzoek",
     "obk": "Officiële bekendmaking",
-    "cvdr": "Rapport",
-    "oor": "Lokale wet- en regelgeving",
+    "cvdr": "Lokale wet- en regelgeving",
+    "oor": "Rapport",
 }
 
 # Initialize NVML for GPU temperature monitoring (optional, can be removed if not needed)
@@ -592,7 +592,7 @@ def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3):
                 response = es.scroll(scroll_id=scroll_id, scroll='30m')
             else:
                 response = es.search(
-                    index=index_name,
+                    index="bron_2025_02_01",
                     query=query,
                     scroll='30m',
                     size=batch_size,
@@ -610,10 +610,10 @@ def main(what_to_index='3_gemeentes'):
     es = ElasticsearchManager.get_client()
     
     # index_name = "jodal_documents7"
-    index_name = "bron_2024_10_11"
+    index_name = "bron_2025_02_01"
 
     # Determine collection name
-    collection_name = f"{what_to_index}_cohere"
+    collection_name = f"{what_to_index}_2025_02_01_cohere"
 
     # qdrant_client.create_collection(
     #     collection_name=collection_name,
@@ -627,7 +627,7 @@ def main(what_to_index='3_gemeentes'):
             collection_name,
             vectors_config={
                 "text-dense": VectorParams(
-                    size=384,
+                    size=1024,
                     distance=Distance.COSINE,
                     datatype=Datatype.UINT8,
                     on_disk=True
@@ -638,7 +638,11 @@ def main(what_to_index='3_gemeentes'):
                     index=SparseIndexParams(on_disk=True)
                 )
             },
-            hnsw_config=HnswConfigDiff(on_disk=True, m=32, ef_construct=100),
+            hnsw_config=HnswConfigDiff(
+                on_disk=True, 
+                m=64, 
+                ef_construct=512
+            ),
             on_disk_payload=True
         )        
     
@@ -655,16 +659,27 @@ def main(what_to_index='3_gemeentes'):
             ],
             "must_not": [
                 {"ids": {"values": elastic_ids}},
-                {"match": {"source": "openspending"}}
             ]
         }
     }
 
     # Define your queries
+    # query_1_gemeente = {
+    #     "query": {
+    #         "term": {
+    #             "_id": "6b99e8898a438871edd132ee35d20d7da49848cf"
+    #         }
+    #     }
+    # }
+
     query_1_gemeente = {
         "query": {
-            "term": {
-                "_id": "6b99e8898a438871edd132ee35d20d7da49848cf"
+            "bool": {
+                "must": [base_query],
+                "should": [
+                    {"match_phrase": {"location": "GM0383"}},
+                ],
+                "minimum_should_match": 1
             }
         }
     }
