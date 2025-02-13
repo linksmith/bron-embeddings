@@ -54,3 +54,8 @@ data/**
 models/**
 
 .env
+experimenting/source_ids-old2.txt
+experimenting/source_ids-old3.txt
+experimenting/source_ids-old4.txt
+experimenting/source_ids-old5.txt
+experimenting/source_ids.txt

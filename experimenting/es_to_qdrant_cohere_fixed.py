@@ -119,7 +119,7 @@ class QdrantClientManager:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = QdrantClient(host="localhost", port=6333, timeout=10)
+                    cls._instance = QdrantClient(host="localhost", port=6333)
         return cls._instance
     
 class SparseEmbedderManager:
@@ -353,7 +353,7 @@ def html_txt_partition(doc):
     #     narative_text_elements = partition_text(
     #         text=element.text,
     # Strip all <p> and </p> tags from the document
-    doc = doc.replace("<p>", "").replace("</p>", "")
+    doc = doc.replace("<p>", "").replace("</p>", "\n\n").replace("<body>", "").replace("</body>", "").replace("<html>", "").replace("</html>", "")
 
     narative_text_elements = partition_text(
         text=doc,
@@ -407,8 +407,15 @@ def remove_processing_instructions(html_text):
         # Error is handled silently
         return html_text
 
-def prepare_qdrant_payload(doc):
+
+def prepare_qdrant_payload(args):    
+    doc, existing_ids = args  # Unpack the arguments
     error_count = 0  # Initialize error counter
+    
+    if doc['_id'] in existing_ids:    
+        logger.info(f"Skipping {doc['_id']} because it already exists in Qdrant")    
+        return None, error_count
+    
     try:
         # Extract the 'description' field
         description = doc.get('_source', {}).get('description', '')
@@ -518,53 +525,15 @@ def generate_dense_embeddings(texts, retries=3, delay=5):
                 time.sleep(delay)
     return None  # Return None to indicate failure after all retries
 
-def upsert_with_progress(collection_name, points, batch_size=1000, max_retries=5, retry_delay=1):
-    """
-    Upsert points to Qdrant with progress bar, retry logic, and error handling.
-    """
+def upsert_with_progress(collection_name, points, batch_size=100):
     qdrant_client = QdrantClientManager.get_client()
     
     total_points = len(points)
-    current_batch_size = batch_size
-    
     with tqdm(total=total_points, desc="Upserting points", position=1, leave=False) as progress_bar:
-        i = 0
-        while i < total_points:
-            batch = points[i:i + current_batch_size]
-            
-            for attempt in range(max_retries):
-                try:
-                    qdrant_client.upsert(
-                        collection_name=collection_name,
-                        points=batch,
-                    )
-                    progress_bar.update(len(batch))
-                    i += len(batch)
-                    # If successful, gradually increase batch size back up
-                    if current_batch_size < batch_size:
-                        current_batch_size = min(batch_size, current_batch_size * 2)
-                    break
-                    
-                except Exception as e:
-                    if "timed out" in str(e).lower():
-                        # More aggressive batch size reduction
-                        current_batch_size = max(1, current_batch_size // 4)
-                        logging.warning(f"Timeout occurred. Reduced batch size to {current_batch_size}")
-                        
-                        if current_batch_size == 1 and attempt == max_retries - 1:
-                            # Log the problematic point
-                            logging.error(f"Failed to upsert point with ID {batch[0].id}. Skipping.")
-                            i += 1  # Skip this point
-                            continue
-                            
-                    if attempt == max_retries - 1:
-                        logging.error(f"Failed to upsert batch after {max_retries} attempts. Error: {type(e).__name__}: {str(e)}")
-                        # Skip the problematic batch
-                        i += len(batch)
-                        break
-                    
-                    logging.warning(f"Upsert attempt {attempt + 1} failed. Retrying in {retry_delay} seconds... Error: {str(e)}")
-                    time.sleep(retry_delay)
+        for i in range(0, total_points, batch_size):
+            batch = points[i:i + batch_size]
+            qdrant_client.upsert(collection_name, batch)
+            progress_bar.update(len(batch))
             
 def embed_documents_on_gpu(embedder, texts, progress_bar, batch_size):
     embeddings = []
@@ -622,7 +591,7 @@ def make_qdrant_points(payloads, dense_vectors, sparse_vectors) -> List[PointStr
 
     return points
 
-def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3, timeout='60s'):
+def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3):
     """Process a batch of documents from Elasticsearch with retry logic."""
     for attempt in range(max_retries):
         try:
@@ -634,8 +603,7 @@ def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3, timeo
                     query=query,
                     scroll='30m',
                     size=batch_size,
-                    timeout=timeout,
-                    request_timeout=60  # Add explicit request timeout
+                    timeout='30s'
                 )
             return response, response['_scroll_id']
         except Exception as e:
@@ -643,6 +611,7 @@ def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3, timeo
                 raise
             logging.warning(f"Attempt {attempt + 1} failed. Retrying in 5 seconds... Error: {str(e)}")
             time.sleep(5)
+            
             
 def main(what_to_index='3_gemeentes'):
     qdrant_client = QdrantClientManager.get_client()    
@@ -679,16 +648,17 @@ def main(what_to_index='3_gemeentes'):
             },
             hnsw_config=HnswConfigDiff(
                 on_disk=True, 
-                m=64, 
-                ef_construct=512
+                m=32, 
+                ef_construct=100
             ),
             on_disk_payload=True
         )        
     
     
     logging.info(f"Getting elastic IDs from Qdrant collection '{collection_name}'.")
-    elastic_ids = get_elastic_ids_from_qdrant(collection_name)
-    logging.info(f"Retrieved {len(elastic_ids)} elastic IDs from Qdrant collection '{collection_name}'.")
+    cache_file = f"source_ids.txt"
+    existing_elastic_ids = get_elastic_ids_from_qdrant(collection_name, cache_file)
+    print(f"Retrieved {len(existing_elastic_ids)} existing elastic IDs from Qdrant collection '{collection_name}'. These will be skipped.")
     
     # Base query
     base_query = {
@@ -700,25 +670,30 @@ def main(what_to_index='3_gemeentes'):
     }
 
     # Define your queries
-    # query_1_gemeente = {
-    #     "query": {
-    #         "term": {
-    #             "_id": "6b99e8898a438871edd132ee35d20d7da49848cf"
-    #         }
-    #     }
-    # }
-
     query_1_gemeente = {
         "query": {
             "bool": {
-                "must": [base_query],
                 "should": [
-                    {"match_phrase": {"location": "GM0383"}},
+                    {"term": {"_id": "d2ed4a79c4c22be7931b36ef8fe15af935bdccae"}},
+                    {"term": {"_id": "6a230233acab98ee05123e8246d37c2d28ddc338"}},
+                    {"term": {"_id": "451e2f5866fe5c80d12875ecc95b3107e6c4a0b8"}},
                 ],
                 "minimum_should_match": 1
             }
         }
     }
+
+    # query_1_gemeente = {
+    #     "query": {
+    #         "bool": {
+    #             "must": [base_query],
+    #             "should": [
+    #                 {"match_phrase": {"location": "GM0383"}},
+    #             ],
+    #             "minimum_should_match": 1
+    #         }
+    #     }
+    # }
 
     query_3_gemeentes = {
         "query": {
@@ -787,7 +762,7 @@ def main(what_to_index='3_gemeentes'):
     # Get total document count for progress bar
     total_docs = es.count(index=index_name, body=query)['count']
 
-    total_docs_to_process = total_docs - len(elastic_ids)
+    total_docs_to_process = total_docs - len(existing_elastic_ids)
     logging.info(f"Total documents to process: {total_docs_to_process}.")
     
     batch_size = BATCH_SIZE
@@ -800,43 +775,22 @@ def main(what_to_index='3_gemeentes'):
 
     print(f"Processing {total_batches} batches of each {batch_size}")
     try:
-        with tqdm(total=total_docs_to_process, desc="Total progress", position=0, dynamic_ncols=True) as pbar:
+        with tqdm(total=total_docs, desc="Total progress", position=0, dynamic_ncols=True) as pbar:
             while True:
                 try:
-                    # Use scan to retrieve documents with increased timeout
-                    es_scan = scan(
-                        client=es, 
-                        index=index_name, 
-                        query=query, 
-                        scroll='240m',
-                        size=BATCH_SIZE,
-                        request_timeout=120  # Increase request timeout
-                    )
+                    # Use scan to retrieve documents
+                    es_scan = scan(client=es, index=index_name, query=query, scroll='30m', size=BATCH_SIZE)
+                    document_batch = batch_iterator(es_scan, batch_size)
 
-                    # Filter documents during processing instead of in the query
-                    def filter_docs():
-                        for doc in es_scan:
-                            if doc['_id'] not in elastic_ids:
-                                yield doc
-
-                    document_batch = batch_iterator(filter_docs(), batch_size)     
-
-                    for batch_num, es_doc in enumerate(document_batch):
+                    for batch_num, es_docs in enumerate(document_batch):
                         try:
-                            # Add batch retry logic
-                            max_batch_retries = 3
-                            for batch_attempt in range(max_batch_retries):
-                                try:
-                                    # Process the documents in the batch
-                                    with multiprocessing.Pool(processes=max_workers) as pool:
-                                        qdrant_payload_list = pool.map(prepare_qdrant_payload, es_doc)
-                                    break  # If successful, break retry loop
-                                except Exception as e:
-                                    if batch_attempt == max_batch_retries - 1:
-                                        raise
-                                    logging.warning(f"Batch {batch_num} attempt {batch_attempt + 1} failed. Retrying... Error: {str(e)}")
-                                    time.sleep(5)
-
+                            # Process the documents in the batch
+                            # Process documents in parallel using multiprocessing
+                            with multiprocessing.Pool(processes=max_workers) as pool:
+                                # Create a list of tuples containing both arguments
+                                pool_args = [(doc, existing_elastic_ids) for doc in es_docs]
+                                qdrant_payload_list = pool.map(prepare_qdrant_payload, pool_args)
+                            
                             # Combine results, filtering out None values
                             qdrant_payloads = []
                             for doc, _ in qdrant_payload_list:
@@ -879,15 +833,16 @@ def main(what_to_index='3_gemeentes'):
                                 sparse_embeddings = generate_sparse_embedding(texts_to_embed)  
                                 points = make_qdrant_points(qdrant_payloads, dense_embeddings, sparse_embeddings)                                
                                 upsert_with_progress(collection_name, points)
-
+                                
                             # Update progress bar
-                            pbar.update(len(es_doc))
+                            pbar.update(len(es_docs))
 
                         except Exception as e:
                             logging.error(f"Error processing batch {batch_num}: {type(e).__name__}: {str(e)}")
                             continue  # Move to the next batch
 
-                    break  # If we've processed all batches without error, break the loop
+                    # If we've processed all batches without error, break the loop
+                    break
 
                 except NotFoundError:
                     print("Search context expired. Restarting from the beginning.")
@@ -911,79 +866,59 @@ def cleanup_multiprocessing():
     # Remove the following line:
     # multiprocessing.current_process()._cleanup()
 
-def get_elastic_ids_from_qdrant(collection_name, max_retries=3, timeout=60):      
-    # Check if cached IDs file exists
-    cache_file = f"source_ids.txt"
-    
+def get_elastic_ids_from_qdrant(collection_name, cache_file):          
     if os.path.exists(cache_file):
         print(f"Loading cached elastic IDs from {cache_file}")
         with open(cache_file, 'r') as f:
             return set(line.strip() for line in f)
-        
+    
     qdrant_client = QdrantClientManager.get_client()
     
     if not qdrant_client.collection_exists(collection_name=collection_name):
         print(f"Collection '{collection_name}' does not exist.")
         return []
     
-    # Get document count with retry logic
-    for attempt in range(max_retries):
-        try:
-            doc_count = qdrant_client.count(collection_name, timeout=100000).count
-            print(f"Total documents in collection '{collection_name}': {doc_count}.")
-            break
-        except Exception as e:
-            if attempt == max_retries - 1:
-                print(f"Failed to get document count after {max_retries} attempts. Error: {str(e)}")
-                return []
-            print(f"Attempt {attempt + 1} failed. Retrying in 5 seconds...")
-            time.sleep(5)
+    doc_count = qdrant_client.count(collection_name).count
+    print(f"Total documents in collection '{collection_name}': {doc_count}.")
 
-    document_ids = set()
+    document_ids = []
     offset = None
-    retrieved = 0
-        
-    pbar = tqdm(desc="Retrieving points", unit="pts", dynamic_ncols=True, total=doc_count)
+    limit = 10000  # Adjust this based on your system's capabilities
     
+    pbar = tqdm(desc="Retrieving points", unit="pts", dynamic_ncols=True, total=doc_count)
+
     while True:
-        # Perform a scroll-like query to fetch points iteratively
-        response = qdrant_client.scroll(
+        scroll_result = qdrant_client.scroll(
             collection_name=collection_name,
-            with_payload=["meta.source_id"],
-            limit=10000,
-            with_vectors=False,
-            offset=offset  # Use offset for pagination
+            limit=limit,
+            offset=offset,
+            with_payload=['meta.source_id'],
+            with_vectors=False
         )
-
-        points, next_offset = response  # Qdrant returns (List[ScoredPoint], Offset)
-
-        # Extract unique source_ids
-        for point in points:
-            source_id = point.payload['meta']['source_id']
-            if source_id:
-                document_ids.add(source_id)
-                    
-        retrieved += len(points)
         
-        pbar.update(len(points))  # Update tqdm progress bar
-        pbar.set_postfix(unique_ids=len(document_ids))
-
-        # Stop when there's no more data
-        if next_offset is None or not points:
+        batch, next_offset = scroll_result
+        
+        if not batch:
             break
 
-        # Update offset for the next batch
-        offset = next_offset        
+        document_ids.extend(doc.payload['meta']['source_id'] for doc in batch)
+        
+        pbar.update(len(batch)) 
+        
+        if next_offset is None:
+            break
+        
+        offset = next_offset
+    
+    # Remove duplicates
+    document_ids = list(set(document_ids))
 
-    print(f"Retrieved {len(document_ids)} unique document IDs.")
-
-    # Write new batch IDs to file
+    print(f"\nRetrieved {len(document_ids)} unique document IDs, and wrote to {cache_file}.")
+    
     if document_ids:
         with open(cache_file, 'a') as f:
             for doc_id in document_ids:
                 f.write(f"{doc_id}\n")
-                
-    print(f"Wrote {len(document_ids)} unique document IDs to file.")
                 
     return document_ids
     
