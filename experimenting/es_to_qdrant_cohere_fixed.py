@@ -2,11 +2,12 @@ import sys
 import os
 import io
 import warnings
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, helpers
 from elasticsearch.helpers import scan
 from elasticsearch.exceptions import NotFoundError
 import pandas as pd
 from tqdm import tqdm
+from itertools import filterfalse
 import multiprocessing
 from multiprocessing import Pool
 from concurrent.futures import ProcessPoolExecutor  # Use ProcessPoolExecutor for multiprocessing
@@ -408,14 +409,9 @@ def remove_processing_instructions(html_text):
         return html_text
 
 
-def prepare_qdrant_payload(args):    
-    doc, existing_ids = args  # Unpack the arguments
+def prepare_qdrant_payload(doc):    
     error_count = 0  # Initialize error counter
-    
-    if doc['_id'] in existing_ids:    
-        logger.info(f"Skipping {doc['_id']} because it already exists in Qdrant")    
-        return None, error_count
-    
+        
     try:
         # Extract the 'description' field
         description = doc.get('_source', {}).get('description', '')
@@ -611,17 +607,245 @@ def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3):
                 raise
             logging.warning(f"Attempt {attempt + 1} failed. Retrying in 5 seconds... Error: {str(e)}")
             time.sleep(5)
+
+def create_and_populate_bloom_filter(es, cache_file, batch_size=10000):
+    """Create and populate an index with processed IDs from cache file."""
+    index_name = "processed_ids_index"
+    
+    # Create index with simple mapping if it doesn't exist
+    settings = {
+        "mappings": {
+            "properties": {
+                "id": {
+                    "type": "keyword",
+                    "doc_values": False,
+                    "norms": False,
+                    "index": True
+                }
+            }
+        }
+    }
+    
+    if not es.indices.exists(index=index_name):
+        es.indices.create(index=index_name, body=settings)
+    else:
+        print(f"Index '{index_name}' already exists.")
+        return index_name
+
+    def process_batch(batch):
+        actions = [
+            {
+                "_index": index_name,
+                "_id": id_,
+                "_source": {"id": id_}
+            }
+            for id_ in batch
+        ]
+        return helpers.bulk(es, actions)
+
+    # Read and index IDs in batches
+    current_batch = []
+    success_count = 0
+    error_count = 0
+    
+    print(f"Reading IDs from {cache_file} and indexing in batches of {batch_size}")
+    
+    # Count total lines first for progress bar
+    with open(cache_file, 'r') as f:
+        total_lines = sum(1 for _ in f)
+    
+    with open(cache_file, 'r') as f:
+        with tqdm(total=total_lines, desc="Indexing IDs") as pbar:
+            for line in f:
+                id_ = line.strip()
+                current_batch.append(id_)
+                
+                if len(current_batch) >= batch_size:
+                    try:
+                        success, errors = process_batch(current_batch)
+                        success_count += success
+                        error_count += len(errors)
+                    except Exception as e:
+                        print(f"Error processing batch: {str(e)}")
+                        error_count += len(current_batch)
+                    
+                    pbar.update(len(current_batch))
+                    current_batch = []
             
-            
+            # Process remaining IDs
+            if current_batch:
+                try:
+                    success, errors = process_batch(current_batch)
+                    success_count += success
+                    error_count += len(errors)
+                except Exception as e:
+                    print(f"Error processing final batch: {str(e)}")
+                    error_count += len(current_batch)
+                pbar.update(len(current_batch))
+    
+    print(f"\nIndexing complete. Successfully indexed {success_count} IDs with {error_count} errors")
+    return index_name
+
+def update_collection_with_processed_flag(index_name="bron_2025_02_01", update_index_mapping=False):
+    es = ElasticsearchManager.get_client()
+    
+    # First, update mapping to ensure is_processed field exists
+    if update_index_mapping:
+        mapping_update = {
+            "properties": {
+                "is_processed": {
+                    "type": "boolean"
+                }
+            }
+        }
+        
+        try:
+            es.indices.put_mapping(index=index_name, body=mapping_update)
+            print(f"Updated mapping for index '{index_name}' to include is_processed field")
+        except Exception as e:
+            print(f"Error updating mapping: {str(e)}")
+            return
+
+    # Initialize scroll for processed_ids_index
+    scroll_size = 10000
+    scroll_time = "30m"
+    
+    # Count total documents in processed_ids_index
+    try:
+        total_docs = es.count(index="processed_ids_index")["count"]
+        print(f"Found {total_docs} documents in processed_ids_index")
+    except Exception as e:
+        print(f"Error counting documents: {str(e)}")
+        return
+
+    # Initialize scroll
+    try:
+        scroll_response = es.search(
+            index="processed_ids_index",
+            scroll=scroll_time,
+            size=scroll_size,
+            body={
+                "query": {"match_all": {}},
+                "_source": ["id"]
+            }
+        )
+    except Exception as e:
+        print(f"Error initializing scroll: {str(e)}")
+        return
+
+    # Get the scroll ID
+    scroll_id = scroll_response["_scroll_id"]
+    total_updated = 0
+    batch_size = 1000
+
+    try:
+        with tqdm(total=total_docs, desc="Processing documents") as pbar:
+            while True:
+                # Get batch of processed IDs
+                batch_hits = scroll_response["hits"]["hits"]
+                if not batch_hits:
+                    break
+
+                # Extract IDs from the batch
+                processed_ids = [hit["_source"]["id"] for hit in batch_hits]
+                
+                # Prepare bulk update actions
+                actions = []
+                for i in range(0, len(processed_ids), batch_size):
+                    batch_ids = processed_ids[i:i + batch_size]
+                    for doc_id in batch_ids:
+                        actions.extend([
+                            {"update": {"_index": index_name, "_id": doc_id}},
+                            {"doc": {"is_processed": True}}
+                        ])
+                    
+                    if actions:
+                        try:
+                            # Execute bulk update
+                            response = es.bulk(body=actions, refresh=True)
+                            
+                            # Count successful updates
+                            successful = sum(1 for item in response["items"] 
+                                          if "update" in item and item["update"]["status"] == 200)
+                            total_updated += successful
+                            
+                            # Clear actions for next batch
+                            actions = []
+                            
+                        except Exception as e:
+                            print(f"\nError in bulk update: {str(e)}")
+                            continue
+
+                # Update progress
+                pbar.update(len(batch_hits))
+                pbar.set_postfix({"updated": total_updated})
+
+                # Get next batch
+                scroll_response = es.scroll(scroll_id=scroll_id, scroll=scroll_time)
+                scroll_id = scroll_response["_scroll_id"]
+
+    except Exception as e:
+        print(f"Error during processing: {str(e)}")
+    finally:
+        # Clear the scroll
+        es.clear_scroll(scroll_id=scroll_id)
+    
+    print(f"\nFinished updating. Successfully marked {total_updated} documents as processed")
+    
+    # Verify the update
+    verify_query = {
+        "query": {
+            "term": {
+                "is_processed": True
+            }
+        }
+    }
+    
+    try:
+        count = es.count(index=index_name, body=verify_query)["count"]
+        print(f"Total documents marked as processed in index: {count}")
+    except Exception as e:
+        print(f"Error verifying update: {str(e)}")
+
+def update_es_processed_flags(es, index_name, points):
+    # Build bulk update actions
+    actions = []
+    for point in points:
+        source_id = point.payload['meta']['source_id']
+        actions.append({
+            "update": {
+                "_index": index_name,
+                "_id": source_id
+            }
+        })
+        actions.append({
+            "doc": {
+                "is_processed": True
+            }
+        })
+    
+    # Execute bulk update
+    if actions:
+        try:
+            response = es.bulk(operations=actions, refresh=True)
+            if response.get('errors'):
+                # Log any errors that occurred during the bulk operation
+                for item in response['items']:
+                    if item.get('update', {}).get('error'):
+                        print(f"Error updating document {item['update']['_id']}: {item['update']['error']}")
+        except Exception as e:
+            print(f"Error in bulk update: {str(e)}")
+
 def main(what_to_index='3_gemeentes'):
     qdrant_client = QdrantClientManager.get_client()    
     es = ElasticsearchManager.get_client()
+    cache_file = f"source_ids.txt"
     
     # index_name = "jodal_documents7"
-    index_name = "bron_2025_02_01"
+    es_index_name = "bron_2025_02_01"
 
     # Determine collection name
-    collection_name = f"{what_to_index}_2025_02_01_cohere"
+    qdrant_collection_name = f"{what_to_index}_2025_02_01_cohere"
 
     # qdrant_client.create_collection(
     #     collection_name=collection_name,
@@ -630,9 +854,9 @@ def main(what_to_index='3_gemeentes'):
     #     on_disk_payload=True
     # )
     collections = qdrant_client.get_collections().collections
-    if collection_name not in [col.name for col in collections]:
+    if qdrant_collection_name not in [col.name for col in collections]:
         qdrant_client.create_collection(
-            collection_name,
+            qdrant_collection_name,
             vectors_config={
                 "text-dense": VectorParams(
                     size=1024,
@@ -655,56 +879,45 @@ def main(what_to_index='3_gemeentes'):
         )        
     
     
-    logging.info(f"Getting elastic IDs from Qdrant collection '{collection_name}'.")
-    cache_file = f"source_ids.txt"
-    existing_elastic_ids = get_elastic_ids_from_qdrant(collection_name, cache_file)
-    print(f"Retrieved {len(existing_elastic_ids)} existing elastic IDs from Qdrant collection '{collection_name}'. These will be skipped.")
+    # logging.info(f"Getting elastic IDs from Qdrant collection '{collection_name}'.")
+    # existing_elastic_ids = get_elastic_ids_from_qdrant(collection_name, cache_file)
+    # print(f"Retrieved {len(existing_elastic_ids)} existing elastic IDs from Qdrant collection '{collection_name}'. These will be skipped.")
     
-    # Base query
-    base_query = {
-        "bool": {
-            "must": [
-                {"exists": {"field": "description"}}
-            ],
-        }
-    }
+    # First, create an index to store processed IDs if it doesn't exist
+    # processed_ids_index = create_processed_ids_index(es, index_name)
+    # processed_ids_index = create_and_populate_bloom_filter(es, cache_file)
+    # store_processed_ids(es, cache_file, 'processed_ids')
 
     # Define your queries
     query_1_gemeente = {
         "query": {
-            "bool": {
-                "should": [
-                    {"term": {"_id": "d2ed4a79c4c22be7931b36ef8fe15af935bdccae"}},
-                    {"term": {"_id": "6a230233acab98ee05123e8246d37c2d28ddc338"}},
-                    {"term": {"_id": "451e2f5866fe5c80d12875ecc95b3107e6c4a0b8"}},
-                ],
-                "minimum_should_match": 1
+            "term": {
+                "_id": "6b99e8898a438871edd132ee35d20d7da49848cf"
             }
         }
     }
 
-    # query_1_gemeente = {
-    #     "query": {
-    #         "bool": {
-    #             "must": [base_query],
-    #             "should": [
-    #                 {"match_phrase": {"location": "GM0383"}},
-    #             ],
-    #             "minimum_should_match": 1
-    #         }
-    #     }
-    # }
-
     query_3_gemeentes = {
         "query": {
             "bool": {
-                "must": [base_query],
-                "should": [
-                    {"match_phrase": {"location": "GM0141"}},
-                    {"match_phrase": {"location": "GM1896"}},
-                    {"match_phrase": {"location": "GM0180"}}
-                ],
-                "minimum_should_match": 1
+                "must": [
+                    {"exists": {"field": "description"}},                    
+                    {
+                        "match_phrase": {
+                            "is_processed": True
+                        }
+                    },
+                    {
+                        "bool": {
+                            "should": [
+                                {"match_phrase": {"location": "GM0141"}},
+                                {"match_phrase": {"location": "GM1896"}},
+                                {"match_phrase": {"location": "GM0180"}}
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    }
+                ]
             }
         }
     }
@@ -712,43 +925,69 @@ def main(what_to_index='3_gemeentes'):
     query_overijssel = {
         "query": {
             "bool": {
-                "must": [base_query],
-                "should": [
-                    {"match_phrase": {"location": "GM0193"}},
-                    {"match_phrase": {"location": "GM0141"}},
-                    {"match_phrase": {"location": "GM0166"}},
-                    {"match_phrase": {"location": "GM1774"}},
-                    {"match_phrase": {"location": "GM0183"}},
-                    {"match_phrase": {"location": "GM0173"}},
-                    {"match_phrase": {"location": "GM0150"}},
-                    {"match_phrase": {"location": "GM1700"}},
-                    {"match_phrase": {"location": "GM0164"}},
-                    {"match_phrase": {"location": "GM0153"}},
-                    {"match_phrase": {"location": "GM0148"}},
-                    {"match_phrase": {"location": "GM1708"}},
-                    {"match_phrase": {"location": "GM0168"}},
-                    {"match_phrase": {"location": "GM0160"}},
-                    {"match_phrase": {"location": "GM0189"}},
-                    {"match_phrase": {"location": "GM0177"}},
-                    {"match_phrase": {"location": "GM1742"}},
-                    {"match_phrase": {"location": "GM0180"}},
-                    {"match_phrase": {"location": "GM1896"}},
-                    {"match_phrase": {"location": "GM0175"}},
-                    {"match_phrase": {"location": "GM1735"}},
-                    {"match_phrase": {"location": "GM0147"}},
-                    {"match_phrase": {"location": "GM0163"}},
-                    {"match_phrase": {"location": "GM0158"}},
-                    {"match_phrase": {"location": "GM1773"}}
-                ],
-                "minimum_should_match": 1
+                "must": [
+                    {"exists": {"field": "description"}},
+                    {
+                        "match_phrase": {
+                            "is_processed": True
+                        }
+                    },
+                    {
+                        "bool": {
+                            "should": [
+                                {"match_phrase": {"location": "GM0193"}},
+                                {"match_phrase": {"location": "GM0141"}},
+                                {"match_phrase": {"location": "GM0166"}},
+                                {"match_phrase": {"location": "GM1774"}},
+                                {"match_phrase": {"location": "GM0183"}},
+                                {"match_phrase": {"location": "GM0173"}},
+                                {"match_phrase": {"location": "GM0150"}},
+                                {"match_phrase": {"location": "GM1700"}},
+                                {"match_phrase": {"location": "GM0164"}},
+                                {"match_phrase": {"location": "GM0153"}},
+                                {"match_phrase": {"location": "GM0148"}},
+                                {"match_phrase": {"location": "GM1708"}},
+                                {"match_phrase": {"location": "GM0168"}},
+                                {"match_phrase": {"location": "GM0160"}},
+                                {"match_phrase": {"location": "GM0189"}},
+                                {"match_phrase": {"location": "GM0177"}},
+                                {"match_phrase": {"location": "GM1742"}},
+                                {"match_phrase": {"location": "GM0180"}},
+                                {"match_phrase": {"location": "GM1896"}},
+                                {"match_phrase": {"location": "GM0175"}},
+                                {"match_phrase": {"location": "GM1735"}},
+                                {"match_phrase": {"location": "GM0147"}},
+                                {"match_phrase": {"location": "GM0163"}},
+                                {"match_phrase": {"location": "GM0158"}},
+                                {"match_phrase": {"location": "GM1773"}}
+                            ],
+                            "minimum_should_match": 1
+                        }
+                    }
+                ]
             }
         }
     }
 
     query_all = {
-        "query": base_query
+        "query": {
+            "bool": {
+                "must": [
+                    {
+                        "exists": {
+                            "field": "description"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                            "is_processed": True
+                        }
+                    }
+                ]
+            }
+        }
     }
-
+    
     # Determine which query to use    
     if what_to_index == '1_gemeente':
         query = query_1_gemeente
@@ -760,10 +999,9 @@ def main(what_to_index='3_gemeentes'):
         query = query_all
     
     # Get total document count for progress bar
-    total_docs = es.count(index=index_name, body=query)['count']
+    total_docs = total_docs_to_process= es.count(index=es_index_name, body=query)['count']
 
-    total_docs_to_process = total_docs - len(existing_elastic_ids)
-    logging.info(f"Total documents to process: {total_docs_to_process}.")
+    logging.info(f"Total documents to process: {total_docs}.")
     
     batch_size = BATCH_SIZE
     total_points_processed = 0
@@ -779,23 +1017,35 @@ def main(what_to_index='3_gemeentes'):
             while True:
                 try:
                     # Use scan to retrieve documents
-                    es_scan = scan(client=es, index=index_name, query=query, scroll='30m', size=BATCH_SIZE)
+                    es_scan = scan(client=es, index=es_index_name, 
+                        query={
+                            **query,
+                            "sort": [
+                                {"_doc": "desc"}  # Sort in descending order
+                            ]
+                        }, scroll='30m', size=BATCH_SIZE)
                     document_batch = batch_iterator(es_scan, batch_size)
 
-                    for batch_num, es_docs in enumerate(document_batch):
+                    for batch_num, es_docs in enumerate(document_batch):                        
                         try:
-                            # Process the documents in the batch
                             # Process documents in parallel using multiprocessing
-                            with multiprocessing.Pool(processes=max_workers) as pool:
-                                # Create a list of tuples containing both arguments
-                                pool_args = [(doc, existing_elastic_ids) for doc in es_docs]
-                                qdrant_payload_list = pool.map(prepare_qdrant_payload, pool_args)
+                            with multiprocessing.Pool(processes=max_workers) as pool:                                
+                                qdrant_payload_list = pool.map(prepare_qdrant_payload, es_docs)                        
+                        # filtered_docs = list(filterfalse(lambda doc: doc['_id'] in existing_elastic_ids, es_docs))
+                        # try:
+                        #     # Process documents in parallel using multiprocessing
+                        #     with multiprocessing.Pool(processes=max_workers) as pool:                                
+                        #         qdrant_payload_list = pool.map(prepare_qdrant_payload, filtered_docs)
                             
                             # Combine results, filtering out None values
                             qdrant_payloads = []
-                            for doc, _ in qdrant_payload_list:
-                                if doc:
+                            skipped_count = 0
+                            for i, (doc, _) in enumerate(qdrant_payload_list):
+                                if doc is not None:
                                     qdrant_payloads.extend(doc)
+                                else:
+                                    skipped_count += 1
+                                    pbar.set_postfix_str(f"Skipped {skipped_count} already processed")
 
                             if qdrant_payloads:
                                 texts_to_embed = []
@@ -832,7 +1082,8 @@ def main(what_to_index='3_gemeentes'):
                                 # Process sparse embeddings
                                 sparse_embeddings = generate_sparse_embedding(texts_to_embed)  
                                 points = make_qdrant_points(qdrant_payloads, dense_embeddings, sparse_embeddings)                                
-                                upsert_with_progress(collection_name, points)
+                                upsert_with_progress(qdrant_collection_name, points)
+                                # update_es_processed_flags(es, es_index_name, points)
                                 
                             # Update progress bar
                             pbar.update(len(es_docs))
@@ -922,6 +1173,40 @@ def get_elastic_ids_from_qdrant(collection_name, cache_file):
                 
     return document_ids
     
+def create_processed_ids_index(es):
+    mapping = {
+        "mappings": {
+            "properties": {
+                "processed_id": {"type": "keyword"}
+            }
+        }
+    }
+    if not es.indices.exists(index="processed_ids"):
+        es.indices.create(index="processed_ids", body=mapping)
+    
+    return "processed_ids"
+
+# Bulk index the processed IDs
+def store_processed_ids(es, ids_file, index_name="processed_ids", batch_size=10000):
+    print(f"Storing processed IDs in {index_name} index.")
+    
+    with open(ids_file, 'r') as f:
+        ids = f.read().splitlines()
+    
+    # Create single document with array of all IDs
+    doc = {
+        "_index": index_name,
+        "_id": "processed_ids",
+        "_source": {
+            "processed_id": ids
+        }
+    }
+    
+    with tqdm(total=1, desc="Storing processed IDs") as pbar:
+        es.index(**doc)
+        pbar.update(1)
+
+# Add this to your main function after creating the processed_ids_index
 if __name__ == "__main__":
     import multiprocessing
     import argparse
@@ -931,16 +1216,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Index documents in Qdrant.")
     parser.add_argument("--what_to_index", choices=["1_gemeente", "3_gemeentes", "overijssel", "nederland"],
                         help="Name of the dataset to index")
+    parser.add_argument("--update_processed_flags", action="store_true",
+                        help="Update is_processed flags in Elasticsearch index")
+    parser.add_argument("--index_name", default="bron_2025_02_01",
+                        help="Name of the Elasticsearch index to update")
     args = parser.parse_args()
 
-    what_to_index = args.what_to_index
-
-    print(f"Indexing {what_to_index} documents in Qdrant.")
-    
-    try:
-        main(what_to_index)
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Terminating processes...")
-        sys.exit(0)
-    finally:
-        cleanup_multiprocessing()
+    if args.update_processed_flags:
+        print(f"Updating processed flags in Elasticsearch index {args.index_name}")
+        update_collection_with_processed_flag(args.index_name)
+    else:
+        print(f"Indexing {args.what_to_index} documents in Qdrant.")
+        try:
+            main(args.what_to_index)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user. Terminating processes...")
+            sys.exit(0)
+        finally:
+            cleanup_multiprocessing()
