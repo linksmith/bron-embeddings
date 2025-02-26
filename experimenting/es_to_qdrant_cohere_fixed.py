@@ -74,7 +74,7 @@ BATCH_SIZE = 500  # Increased due to high memory availability
 SLEEP_TIME = 0     # Set sleep time to zero since GPUs are underutilized
 DENSE_BATCH_SIZE = 96  # Larger batches for embedding
 SPARSE_BATCH_SIZE = 1000
-NUM_WORKERS = max_workers = 12  # Leave 4 cores for system processes
+NUM_WORKERS = max_workers = 10  # Leave 4 cores for system processes
 
 # Unstructured Chunking Parameters
 COMBINE_TEXT_UNDER_N_CHARS=800
@@ -120,7 +120,7 @@ class QdrantClientManager:
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
-                    cls._instance = QdrantClient(host="localhost", port=6333)
+                    cls._instance = QdrantClient(host="localhost", port=6333, timeout=60)
         return cls._instance
     
 class SparseEmbedderManager:
@@ -165,7 +165,7 @@ class ElasticsearchManager:
     
 def is_empty(text):    
     if len(text) == 0:
-        logger.debug(f"is_empty: {text}")
+        # logger.debug(f"is_empty: {text}")
         return True
     
     return False
@@ -242,7 +242,7 @@ def html_table_to_markdown(html_table):
 
 def element_to_markdown(element):
     if has_page_numbers(element.text):
-        logger.debug(f"has_page_numbers: {element.text}")
+        # logger.debug(f"has_page_numbers: {element.text}")
         return ""
     
     text = ""
@@ -521,7 +521,7 @@ def generate_dense_embeddings(texts, retries=3, delay=5):
                 time.sleep(delay)
     return None  # Return None to indicate failure after all retries
 
-def upsert_with_progress(collection_name, points, batch_size=100):
+def upsert_with_progress(collection_name, points, batch_size=5000):
     qdrant_client = QdrantClientManager.get_client()
     
     total_points = len(points)
@@ -529,7 +529,9 @@ def upsert_with_progress(collection_name, points, batch_size=100):
         for i in range(0, total_points, batch_size):
             batch = points[i:i + batch_size]
             qdrant_client.upsert(collection_name, batch)
+            time.sleep(2)
             progress_bar.update(len(batch))
+            
             
 def embed_documents_on_gpu(embedder, texts, progress_bar, batch_size):
     embeddings = []
@@ -595,7 +597,7 @@ def process_es_batch(es, query, batch_size, scroll_id=None, max_retries=3):
                 response = es.scroll(scroll_id=scroll_id, scroll='30m')
             else:
                 response = es.search(
-                    index="bron_2025_02_01",
+                    index="bron_2025_02_01v3",
                     query=query,
                     scroll='30m',
                     size=batch_size,
@@ -686,7 +688,9 @@ def create_and_populate_bloom_filter(es, cache_file, batch_size=10000):
     print(f"\nIndexing complete. Successfully indexed {success_count} IDs with {error_count} errors")
     return index_name
 
-def update_collection_with_processed_flag(index_name="bron_2025_02_01", update_index_mapping=False):
+
+
+def update_collection_with_processed_flag(index_name="bron_2025_02_01v3", cache_file='source_ids.txt', qdrant_collection_name='nederland_2025_02_01_cohere', update_index_mapping=False):
     es = ElasticsearchManager.get_client()
     
     # First, update mapping to ensure is_processed field exists
@@ -706,108 +710,228 @@ def update_collection_with_processed_flag(index_name="bron_2025_02_01", update_i
             print(f"Error updating mapping: {str(e)}")
             return
 
-    # Initialize scroll for processed_ids_index
-    scroll_size = 10000
-    scroll_time = "30m"
+    existing_elastic_ids = []
     
-    # Count total documents in processed_ids_index
-    try:
-        total_docs = es.count(index="processed_ids_index")["count"]
-        print(f"Found {total_docs} documents in processed_ids_index")
-    except Exception as e:
-        print(f"Error counting documents: {str(e)}")
-        return
+    if not os.path.exists(cache_file):
+        print(f"Cache file {cache_file} does not exist. Getting elastic IDs from Qdrant collection '{qdrant_collection_name}'.")
+        existing_elastic_ids = get_elastic_ids_from_qdrant(collection_name=qdrant_collection_name, cache_file=cache_file)
+        # Save elastic IDs to cache file
+        print(f"Saving {len(existing_elastic_ids)} elastic IDs to {cache_file}")
+        try:
+            with open(cache_file, 'w') as f:
+                for id_ in existing_elastic_ids:
+                    f.write(f"{id_}\n")
+            print(f"Successfully saved elastic IDs to {cache_file}")
+        except Exception as e:
+            print(f"Error saving elastic IDs to file: {str(e)}")
+            return
+    else:
+        print(f"Reading elastic IDs from cache file {cache_file}")
+        try:
+            with open(cache_file, 'r') as f:
+                existing_elastic_ids = [line.strip() for line in f]
+            print(f"Successfully read {len(existing_elastic_ids)} elastic IDs from {cache_file}")
+        except Exception as e:
+            print(f"Error reading elastic IDs from file: {str(e)}")
+            return
+        
+    # Update is_processed flag for existing IDs in batches
+    batch_size = 500
+    total_ids = len(existing_elastic_ids)
+    processed = 0
+    errors = 0
 
-    # Initialize scroll
-    try:
-        scroll_response = es.search(
-            index="processed_ids_index",
-            scroll=scroll_time,
-            size=scroll_size,
-            body={
-                "query": {"match_all": {}},
-                "_source": ["id"]
-            }
-        )
-    except Exception as e:
-        print(f"Error initializing scroll: {str(e)}")
-        return
+    bulk_actions = []
+    
+    print(f"Updating is_processed flag for {total_ids} documents...")
 
-    # Get the scroll ID
-    scroll_id = scroll_response["_scroll_id"]
-    total_updated = 0
-    batch_size = 1000
-
-    try:
-        with tqdm(total=total_docs, desc="Processing documents") as pbar:
-            while True:
-                # Get batch of processed IDs
-                batch_hits = scroll_response["hits"]["hits"]
-                if not batch_hits:
-                    break
-
-                # Extract IDs from the batch
-                processed_ids = [hit["_source"]["id"] for hit in batch_hits]
+    with tqdm(total=total_ids, desc="Updating documents", unit="docs") as pbar:
+        for i in range(0, total_ids, batch_size):
+            batch = existing_elastic_ids[i:i + batch_size]
+            bulk_actions = []
+            
+            for doc_id in batch:
+                bulk_actions.append({
+                    "update": {
+                        "_index": index_name,
+                        "_id": doc_id,
+                        "_source": False,  # Don't return the source
+                        "retry_on_conflict": 3
+                    }
+                })
+                bulk_actions.append({
+                    "script": {
+                        "source": "ctx._source.is_processed = true",
+                        "lang": "painless"
+                    }
+                })
+            
+            try:
+                # Execute bulk update with error checking
+                response = es.bulk(index=index_name, 
+                                 operations=bulk_actions, 
+                                 refresh=True,
+                                 timeout="60s")
                 
-                # Prepare bulk update actions
-                actions = []
-                for i in range(0, len(processed_ids), batch_size):
-                    batch_ids = processed_ids[i:i + batch_size]
-                    for doc_id in batch_ids:
-                        actions.extend([
-                            {"update": {"_index": index_name, "_id": doc_id}},
-                            {"doc": {"is_processed": True}}
-                        ])
+                # Process the response
+                if response:
+                    success_count = 0
+                    error_count = 0
                     
-                    if actions:
-                        try:
-                            # Execute bulk update
-                            response = es.bulk(body=actions, refresh=True)
-                            
-                            # Count successful updates
-                            successful = sum(1 for item in response["items"] 
-                                          if "update" in item and item["update"]["status"] == 200)
-                            total_updated += successful
-                            
-                            # Clear actions for next batch
-                            actions = []
-                            
-                        except Exception as e:
-                            print(f"\nError in bulk update: {str(e)}")
-                            continue
+                    for item in response['items']:
+                        update_status = item.get('update', {}).get('status')
+                        if update_status in [200, 201]:
+                            success_count += 1
+                        else:
+                            error_count += 1
+                            error_detail = item.get('update', {}).get('error')
+                            if error_detail:
+                                print(f"Error updating doc {item['update']['_id']}: {error_detail}")
+                    
+                    processed += success_count
+                    errors += error_count
+                
+            except Exception as e:
+                print(f"Bulk update error: {str(e)}")
+                errors += len(batch)
+            
+            pbar.update(len(batch))
+            pbar.set_postfix({'processed': processed, 'errors': errors})
 
-                # Update progress
-                pbar.update(len(batch_hits))
-                pbar.set_postfix({"updated": total_updated})
+    print(f"Finished updating is_processed flag. Successfully updated {processed} documents with {errors} errors")
+    
+    
+#     # Create processed_ids_index if it doesn't exist
+#     processed_ids_index = create_processed_ids_index(es)
+    
+#     # Get existing processed IDs from the index
+#     try:
+#         existing_processed = es.get(index=processed_ids_index, id="processed_ids")
+#         existing_processed_ids = set(existing_processed['_source']['id'])
+#     except:
+#         existing_processed_ids = set()
+    
+#     # Combine with new IDs, removing duplicates
+#     all_processed_ids = list(existing_processed_ids.union(set(existing_elastic_ids)))
+    
+#     # Update the processed IDs document
+#     doc = {
+#         "_index": processed_ids_index,
+#         "_id": "processed_ids", 
+#         "_source": {
+#             "id": all_processed_ids
+#         }
+#     }
+    
+#     try:
+#         es.index(**doc)
+#         print(f"Successfully updated processed_ids_index with {len(all_processed_ids)} unique IDs")
+#     except Exception as e:
+#         print(f"Error updating processed_ids_index: {str(e)}")
+#         return
+#     # Initialize scroll for processed_ids_index
+#     scroll_size = 10000
+#     scroll_time = "30m"
+    
+#     # Count total documents in processed_ids_index
+#     try:
+#         total_docs = es.count(index="processed_ids_index")["count"]
+#         print(f"Found {total_docs} documents in processed_ids_index")
+#     except Exception as e:
+#         print(f"Error counting documents: {str(e)}")
+#         return
 
-                # Get next batch
-                scroll_response = es.scroll(scroll_id=scroll_id, scroll=scroll_time)
-                scroll_id = scroll_response["_scroll_id"]
+#     # Initialize scroll
+#     try:
+#         scroll_response = es.search(
+#             index="processed_ids_index",
+#             scroll=scroll_time,
+#             size=scroll_size,
+#             body={
+#                 "query": {"match_all": {}},
+#                 "_source": ["id"]
+#             }
+#         )
+#     except Exception as e:
+#         print(f"Error initializing scroll: {str(e)}")
+#         return
 
-    except Exception as e:
-        print(f"Error during processing: {str(e)}")
-    finally:
-        # Clear the scroll
-        es.clear_scroll(scroll_id=scroll_id)
+#     # Get the scroll ID
+#     scroll_id = scroll_response["_scroll_id"]
+#     total_updated = 0
+#     batch_size = 1000
+
+#     try:
+#         with tqdm(total=total_docs, desc="Processing documents") as pbar:
+#             while True:
+#                 # Get batch of processed IDs
+#                 batch_hits = scroll_response["hits"]["hits"]
+#                 if not batch_hits:
+#                     break
+
+#                 # Extract IDs from the batch
+#                 processed_ids = [hit["_source"]["id"] for hit in batch_hits]
+                
+#                 # Prepare bulk update actions
+#                 actions = []
+#                 for i in range(0, len(processed_ids), batch_size):
+#                     batch_ids = processed_ids[i:i + batch_size]
+#                     for doc_id in batch_ids:
+#                         actions.extend([
+#                             {"update": {"_index": index_name, "_id": doc_id}},
+#                             {"doc": {"is_processed": True}}
+#                         ])
+                    
+#                     if actions:
+#                         try:
+#                             # Execute bulk update
+#                             response = es.bulk(body=actions, refresh=True)
+                            
+#                             # Count successful updates
+#                             successful = sum(1 for item in response["items"] 
+#                                           if "update" in item and item["update"]["status"] == 200)
+#                             total_updated += successful
+                            
+#                             # Clear actions for next batch
+#                             actions = []
+                            
+#                         except Exception as e:
+#                             print(f"\nError in bulk update: {str(e)}")
+#                             continue
+
+#                 # Update progress
+#                 pbar.update(len(batch_hits))
+#                 pbar.set_postfix({"updated": total_updated})
+
+#                 # Get next batch
+#                 scroll_response = es.scroll(scroll_id=scroll_id, scroll=scroll_time)
+#                 scroll_id = scroll_response["_scroll_id"]
+
+#     except Exception as e:
+#         print(f"Error during processing: {str(e)}")
+#     finally:
+#         # Clear the scroll
+#         es.clear_scroll(scroll_id=scroll_id)
     
-    print(f"\nFinished updating. Successfully marked {total_updated} documents as processed")
+#     print(f"\nFinished updating. Successfully marked {total_updated} documents as processed")
     
-    # Verify the update
-    verify_query = {
-        "query": {
-            "term": {
-                "is_processed": True
-            }
-        }
-    }
+#     # Verify the update
+#     verify_query = {
+#         "query": {
+#             "term": {
+#                 "is_processed": True
+#             }
+#         }
+#     }
     
-    try:
-        count = es.count(index=index_name, body=verify_query)["count"]
-        print(f"Total documents marked as processed in index: {count}")
-    except Exception as e:
-        print(f"Error verifying update: {str(e)}")
+#     try:
+#         count = es.count(index=index_name, body=verify_query)["count"]
+#         print(f"Total documents marked as processed in index: {count}")
+#     except Exception as e:
+#         print(f"Error verifying update: {str(e)}")
 
 def update_es_processed_flags(es, index_name, points):
+    print(f"Updating {len(points)} documents in index {index_name}.")
     # Build bulk update actions
     actions = []
     for point in points:
@@ -818,16 +942,17 @@ def update_es_processed_flags(es, index_name, points):
                 "_id": source_id
             }
         })
+        # Second line: the partial doc specifying your field
         actions.append({
             "doc": {
                 "is_processed": True
-            }
+            },
         })
-    
+        
     # Execute bulk update
     if actions:
         try:
-            response = es.bulk(operations=actions, refresh=True)
+            response = es.bulk(index=index_name, operations=actions, refresh=True)
             if response.get('errors'):
                 # Log any errors that occurred during the bulk operation
                 for item in response['items']:
@@ -836,16 +961,18 @@ def update_es_processed_flags(es, index_name, points):
         except Exception as e:
             print(f"Error in bulk update: {str(e)}")
 
-def main(what_to_index='3_gemeentes'):
+def update_es_processed_file(es, index_name, points):
+    print(f"Updating {len(points)} documents in index {index_name}.")
+    # Build bulk update actions
+    actions = []
+    with open('processed_ids.txt', 'w') as f:
+        for point in points:
+            source_id = point.payload['meta']['source_id']
+            f.write(f"{source_id}\n")
+
+def main(what_to_index='3_gemeentes', cache_file='source_ids.txt', es_index_name='bron_2025_02_01v3', qdrant_collection_name='nederland_2025_02_01_cohere'):
     qdrant_client = QdrantClientManager.get_client()    
     es = ElasticsearchManager.get_client()
-    cache_file = f"source_ids.txt"
-    
-    # index_name = "jodal_documents7"
-    es_index_name = "bron_2025_02_01"
-
-    # Determine collection name
-    qdrant_collection_name = f"{what_to_index}_2025_02_01_cohere"
 
     # qdrant_client.create_collection(
     #     collection_name=collection_name,
@@ -977,17 +1104,70 @@ def main(what_to_index='3_gemeentes'):
                         "exists": {
                             "field": "description"
                         }
+                    }
+                ],
+                "must_not": [
+                    {
+                        "match_phrase": {
+                        "is_processed": False
+                        }
                     },
                     {
                         "match_phrase": {
-                            "is_processed": True
+                        "description.keyword": ""
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\u0002\u0003\u0004\u0005\u0006\u0007\b\b\t\u0005\u000b\f\r\u0003\u0003\u000e\u0006\u000e\n\u000f\u0010\u0011\u0012\u0012\u0011\u0006\u0013\u0003\u0003\u0012\u0014\u0003\u0004\u0015\u0006\u000e\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
+                        }
+                    },
+                    {
+                        "match_phrase": {
+                        "description.keyword": "\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n"
                         }
                     }
                 ]
             }
         }
     }
-    
+                 
+    query = query_all
     # Determine which query to use    
     if what_to_index == '1_gemeente':
         query = query_1_gemeente
@@ -1001,7 +1181,7 @@ def main(what_to_index='3_gemeentes'):
     # Get total document count for progress bar
     total_docs = total_docs_to_process= es.count(index=es_index_name, body=query)['count']
 
-    logging.info(f"Total documents to process: {total_docs}.")
+    print(f"Total documents to process: {total_docs}.")
     
     batch_size = BATCH_SIZE
     total_points_processed = 0
@@ -1017,13 +1197,7 @@ def main(what_to_index='3_gemeentes'):
             while True:
                 try:
                     # Use scan to retrieve documents
-                    es_scan = scan(client=es, index=es_index_name, 
-                        query={
-                            **query,
-                            "sort": [
-                                {"_doc": "desc"}  # Sort in descending order
-                            ]
-                        }, scroll='30m', size=BATCH_SIZE)
+                    es_scan = scan(client=es, index=es_index_name, query=query, scroll='30m', size=BATCH_SIZE)
                     document_batch = batch_iterator(es_scan, batch_size)
 
                     for batch_num, es_docs in enumerate(document_batch):                        
@@ -1031,11 +1205,6 @@ def main(what_to_index='3_gemeentes'):
                             # Process documents in parallel using multiprocessing
                             with multiprocessing.Pool(processes=max_workers) as pool:                                
                                 qdrant_payload_list = pool.map(prepare_qdrant_payload, es_docs)                        
-                        # filtered_docs = list(filterfalse(lambda doc: doc['_id'] in existing_elastic_ids, es_docs))
-                        # try:
-                        #     # Process documents in parallel using multiprocessing
-                        #     with multiprocessing.Pool(processes=max_workers) as pool:                                
-                        #         qdrant_payload_list = pool.map(prepare_qdrant_payload, filtered_docs)
                             
                             # Combine results, filtering out None values
                             qdrant_payloads = []
@@ -1046,7 +1215,7 @@ def main(what_to_index='3_gemeentes'):
                                 else:
                                     skipped_count += 1
                                     pbar.set_postfix_str(f"Skipped {skipped_count} already processed")
-
+                            
                             if qdrant_payloads:
                                 texts_to_embed = []
                                 for doc in qdrant_payloads:
@@ -1084,6 +1253,7 @@ def main(what_to_index='3_gemeentes'):
                                 points = make_qdrant_points(qdrant_payloads, dense_embeddings, sparse_embeddings)                                
                                 upsert_with_progress(qdrant_collection_name, points)
                                 # update_es_processed_flags(es, es_index_name, points)
+                                update_es_processed_file(es, es_index_name, points)
                                 
                             # Update progress bar
                             pbar.update(len(es_docs))
@@ -1218,17 +1388,20 @@ if __name__ == "__main__":
                         help="Name of the dataset to index")
     parser.add_argument("--update_processed_flags", action="store_true",
                         help="Update is_processed flags in Elasticsearch index")
-    parser.add_argument("--index_name", default="bron_2025_02_01",
+    parser.add_argument("--index_name", default="bron_2025_02_01v3",
                         help="Name of the Elasticsearch index to update")
     args = parser.parse_args()
 
-    if args.update_processed_flags:
-        print(f"Updating processed flags in Elasticsearch index {args.index_name}")
-        update_collection_with_processed_flag(args.index_name)
+    cache_file = f"source_ids.txt"
+    es_index_name = "bron_2025_02_01v3"
+    qdrant_collection_name = f"{args.what_to_index}_2025_02_01_cohere"
+    
+    if args.update_processed_flags:           
+        update_collection_with_processed_flag(index_name="bron_2025_02_01v3", cache_file='source_ids.txt', qdrant_collection_name='nederland_2025_02_01_cohere', update_index_mapping=False)
     else:
         print(f"Indexing {args.what_to_index} documents in Qdrant.")
         try:
-            main(args.what_to_index)
+            main(what_to_index=args.what_to_index, qdrant_collection_name=qdrant_collection_name, es_index_name=es_index_name, cache_file=cache_file)
         except KeyboardInterrupt:
             print("\nInterrupted by user. Terminating processes...")
             sys.exit(0)
